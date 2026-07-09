@@ -1,124 +1,134 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from typing import Any
-
-import structlog
+from typing import TYPE_CHECKING
 
 from stevie.events import StevieEvent
+from stevie.identifiers import ServiceName, TelemetryMessage, Topic
 
-log = structlog.get_logger()
+if TYPE_CHECKING:
+    from stevie.telemetry import TelemetryService
 
-EventHandler = Callable[[Any], Awaitable[None]]
+
+EventHandler = Callable[[StevieEvent], Awaitable[None]]
+
 
 @dataclass(frozen=True, slots=True)
 class Subscription:
     topic_pattern: str
     handler: EventHandler
 
+
 class EventBus:
-    def __init__(self):
+    name = ServiceName.EVENTBUS
+
+    def __init__(self) -> None:
         self._subscriptions: list[Subscription] = []
-        self._tasks: set[asycnio.Task[None]] = set()
-    
+        self._tasks: set[asyncio.Task[None]] = set()
+        self.telemetry: TelemetryService | None = None
+
+    def set_telemetry(self, telemetry: TelemetryService) -> None:
+        self.telemetry = telemetry
+
     def subscribe(self, topic_pattern: str, handler: EventHandler) -> None:
         self._subscriptions.append(
-            Subscription(topic_pattern=topic_pattern, handler=handler)
+            Subscription(
+                topic_pattern=str(topic_pattern),
+                handler=handler,
+            )
         )
 
-        log.info(
-            "eventbus.subscribed",
-            topic_pattern=topic_pattern,
-            handler=getattr(handler, "__name__", repr(handler))
-        )
-    
-    def unsubscribed(self, topic_pattern: str, handler: EventHandler) -> None:
+    def unsubscribe(self, topic_pattern: str, handler: EventHandler) -> None:
         self._subscriptions = [
             sub
             for sub in self._subscriptions
             if not (
-                sub.topic_pattern == topic_pattern
+                sub.topic_pattern == str(topic_pattern)
                 and sub.handler == handler
             )
         ]
 
-        log.info(
-            "eventbus.unsubscribed",
-            topic_pattern=topic_pattern,
-            handler=getattr(handler, "__name__", repr(handler))
-        )
+    async def publish(self, event: StevieEvent) -> None:
+        handlers = self._matching_handlers(str(event.topic))
 
-    async def publish(self, event:Any) -> None:
-        """
-        Fire-and-forget publish
-
-        Handlers run in background tasks
-        """
-        handlers = self._matching_handlers(event.topic)
-
-        log.info(
-            "eventbus.publish",
-            topic=event.topic,
-            source=event.source,
+        await self._emit_telemetry(
+            TelemetryMessage.EVENTBUS_PUBLISH,
+            topic=str(event.topic),
+            origin=str(event.source),
             event_id=event.event_id,
-            handlers=len(handlers)
+            handlers=len(handlers),
         )
 
         for handler in handlers:
-            task = asycnio.create_task(
+            task = asyncio.create_task(
                 self._run_handler(handler, event)
             )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
-    
-    async def publish_sync(self, event: StevieEvent) -> None:
-        """
-        Publish and wait for all handlers to finish
-        """
-        handlers = self._matching_handlers(event.topic)
 
-        log.info(
-            "eventbus.publish_sync",
-            topic=event.topic,
-            source=event.source,
+    async def publish_sync(self, event: StevieEvent) -> None:
+        handlers = self._matching_handlers(str(event.topic))
+
+        await self._emit_telemetry(
+            TelemetryMessage.EVENTBUS_PUBLISH_SYNC,
+            topic=str(event.topic),
+            origin=str(event.source),
             event_id=event.event_id,
-            handlers=len(handlers)
+            handlers=len(handlers),
         )
 
         await asyncio.gather(
             *(self._run_handler(handler, event) for handler in handlers)
         )
-    
+
     def _matching_handlers(self, topic: str) -> list[EventHandler]:
         return [
             sub.handler
             for sub in self._subscriptions
             if self._topic_matches(sub.topic_pattern, topic)
         ]
-    
+
     @staticmethod
     def _topic_matches(pattern: str, topic: str) -> bool:
         if pattern == "*":
             return True
-        
+
         return fnmatch(topic, pattern)
-    
+
     async def _run_handler(
         self,
         handler: EventHandler,
-        event: StevieEvent
+        event: StevieEvent,
     ) -> None:
         try:
             await handler(event)
-        except Exception:
-            log.excetption(
-                "eventbus.handler_failed",
-                topic=event.topic,
-                source=event.source,
+
+        except Exception as exc:
+            await self._emit_telemetry(
+                TelemetryMessage.EVENTBUS_HANDLER_FAILED,
+                topic=str(event.topic),
+                origin=str(event.source),
                 event_id=event.event_id,
-                handler=getattr(handler, "__name__", repr(handler))
+                handler=getattr(handler, "__name__", repr(handler)),
+                error=str(exc),
             )
+
+    async def _emit_telemetry(
+        self,
+        message: TelemetryMessage,
+        **context,
+    ) -> None:
+        if self.telemetry is None:
+            return
+
+        if context.get("topic") == str(Topic.SYSTEM_TELEMETRY_CREATED):
+            return
+
+        await self.telemetry.emit(
+            message,
+            source=ServiceName.EVENTBUS,
+            **context,
+        )

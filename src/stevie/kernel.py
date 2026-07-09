@@ -5,10 +5,7 @@ import signal
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-import structlog
-
-log = structlog.get_logger()
-
+from stevie.identifiers import ServiceName, TelemetryMessage
 
 @runtime_checkable
 class Service(Protocol):
@@ -31,7 +28,9 @@ class StevieKernel:
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register(self, component: Any, name: str | None = None) -> None:
-        component_name = name or getattr(component, "name", component.__class__.__name__)
+        component_name = str(
+            name or getattr(component, "name", component.__class__.__name__)
+        )
 
         if component_name in self._registry:
             raise ValueError(f"Component already registered: {component_name}")
@@ -41,41 +40,52 @@ class StevieKernel:
         if isinstance(component, Service):
             self._services.append(component)
 
-        log.info(
-            "kernel.component_registered",
-            component=component_name,
-            is_service=isinstance(component, Service),
-        )
+    def get(self, name: str | ServiceName) -> Any:
+        return self._registry[str(name)]
 
-    def get(self, name: str) -> Any:
-        return self._registry[name]
-
-    def has(self, name: str) -> bool:
-        return name in self._registry
+    def has(self, name: str | ServiceName) -> bool:
+        return str(name) in self._registry
 
     async def start(self) -> None:
-        log.info("kernel.starting", name=self.name)
+        await self._emit(
+            TelemetryMessage.KERNEL_STARTING,
+            name=self.name
+        )
 
         started_services: list[Service] = []
 
         try:
             for service in self._services:
-                log.info("kernel.service_starting", service=service.name)
+                await self._emit(
+                    TelemetryMessage.KERNEL_SERVICE_STARTING,
+                    service=str(service.name)
+                )
                 await service.start()
                 started_services.append(service)
-                log.info("kernel.service_started", service=service.name)
+
+                await self._emit(
+                    TelemetryMessage.KERNEL_SERVICE_STARTED,
+                    service=str(service.name)
+                )
 
             self.running = True
-            log.info("kernel.started", name=self.name)
+            await self._emit(
+                TelemetryMessage.KERNEL_STARTED,
+                name=self.name
+            )
 
         except Exception:
-            log.exception("kernel.start_failed")
+            await self._emit(
+                TelemetryMessage.KERNEL_START_FAILED,
+                name=self.name,
+                error=str(exc)
+            )
 
             for service in reversed(started_services):
                 try:
                     await service.stop()
                 except Exception:
-                    log.exception("kernel.service_rollback_failed", service=service.name)
+                    pass
 
             raise
 
@@ -83,26 +93,41 @@ class StevieKernel:
         if not self.running:
             return
 
-        log.info("kernel.stopping", name=self.name)
+        await self._emit(
+            TelemetryMessage.KERNEL_STOPPING,
+            name=self.name
+        )
 
         for service in reversed(self._services):
             try:
-                log.info("kernel.service_stopping", service=service.name)
+                await self.emit(
+                    TelemetryMessage.KERNEL_SERVICE_STOPPING,
+                    service=str(service.name)
+                )
                 await service.stop()
-                log.info("kernel.service_stopped", service=service.name)
-            except Exception:
-                log.exception("kernel.service_stop_failed", service=service.name)
+                await self.emit(
+                    TelemetryMessage.KERNEL_SERVICE_STOPPED,
+                    service=str(service.name)
+                )
+            except Exception as exc:
+                await self._emit(
+                    TelemetryMessage.KERNEL_SERVICE_STOP_FAILED,
+                    service=str(service.name),
+                    error=str(exc)
+                )
 
         self.running = False
         self._stop_event.set()
 
-        log.info("kernel.stopped", name=self.name)
+        await self._emit(
+            TelemetryMessage.KERNEL_STOPPED,
+            name=self.name
+        )
 
     async def wait_until_stopped(self) -> None:
         await self._stop_event.wait()
 
     def request_stop(self) -> None:
-        log.info("kernel.stop_requested", name=self.name)
         self._stop_event.set()
 
     def install_signal_handlers(self) -> None:
@@ -110,3 +135,19 @@ class StevieKernel:
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.request_stop)
+
+    async def _emit(
+        self,
+        message: TelemetryMessage,
+        **context
+    ) -> None:
+        if not self.has(ServiceName.TELEMETRY):
+            return
+        
+        telemetry = self.get(ServiceName.TELEMETRY)
+
+        await telemetry.emit(
+            message,
+            source="kernel",
+            **context
+        )

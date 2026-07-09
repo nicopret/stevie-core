@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import structlog
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from stevie.identifiers import ServiceName
+
+log = structlog.get_logger()
 
 class StevieSettings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -16,14 +21,12 @@ class StevieSettings(BaseSettings):
     samsung_tv_ip: str | None = None
     samsung_tv_token_file: str = "data/samsung.token"
 
-class ConfigurationService:
-    name = "configuration"
+class Configuration:
+    name = ServiceName.CONFIGURATION
 
     def __init__(self) -> None:
-        self.settings: StevieSettings | None = None
-    
-    async def start(self) -> None:
         self.settings = StevieSettings()
-
-    async def stop(self) -> None:
-        pass
+        log.info(
+            "configuration.loaded",
+            environment=self.settings.stevie_env
+        )
