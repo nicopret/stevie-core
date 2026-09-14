@@ -17,9 +17,10 @@ class StevieSettings(BaseSettings):
     stevie_env: str = "development"
 
     database_url: str = "sqlite://data/stevie.db"
+    devices_file: str = "data/devices.json"
+    api_host: str = "0.0.0.0"
+    api_port: int = 8000
 
-    samsung_tv_ip: str | None = None
-    samsung_tv_token_file: str = "data/samsung.token"
 
 class Configuration:
     name = ServiceName.CONFIGURATION

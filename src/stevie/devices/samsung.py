@@ -4,13 +4,16 @@ import asyncio
 import base64
 import json
 import ssl
-from pathlib import Path
+from typing import Any
+
+from stevie.devices.commands import Command, CommandDefinition, DeviceTransportUnavailableError
+from stevie.devices.samsung_commands import catalogue, validate_arguments
 from urllib.parse import urlencode
 
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from stevie.config import Configuration
+from stevie.devices.models import Device
 from stevie.eventbus import EventBus
 from stevie.events import StevieEvent
 from stevie.identifiers import ServiceName, TelemetryMessage, Topic
@@ -19,78 +22,101 @@ from stevie.telemetry import TelemetryService
 
 
 class SamsungTVService:
-    name = ServiceName.SAMSUNG_TV
+    target_name = "samsung.remote.control"
 
     def __init__(
         self,
         kernel: StevieKernel,
+        device: Device,
         app_name: str = "Stevie",
     ) -> None:
+        if not any(target.name == self.target_name for target in device.targets):
+            raise ValueError(f"Device {device.id} requires target {self.target_name}")
+        self.device = device
+        self.name = f"{ServiceName.SAMSUNG_TV}:{device.id}"
         self.kernel = kernel
         self.app_name = app_name
-
-        self.ip: str | None = None
-        self.token_file: Path | None = None
 
         self.eventbus: EventBus | None = None
         self.telemetry: TelemetryService | None = None
 
         self._ws: ClientConnection | None = None
 
+    @property
+    def device_id(self) -> str:
+        return self.device.id
+
+    def command_catalogue(self) -> list[CommandDefinition]:
+        return catalogue()
+
+    async def execute_command(self, command: Command, arguments: dict[str, Any]) -> None:
+        values = validate_arguments(command, arguments)
+        if self._ws is None:
+            raise DeviceTransportUnavailableError('Device transport is unavailable')
+        if command == Command.KEY:
+            await self.press(values['key'])
+        elif command == Command.CHANNEL_SELECT:
+            await self.channel(values['channel'])
+        elif command in {Command.BACK, Command.CHANNEL_UP, Command.CHANNEL_DOWN}:
+            await self.press({Command.BACK: 'KEY_RETURN', Command.CHANNEL_UP: 'KEY_CHUP',
+                              Command.CHANNEL_DOWN: 'KEY_CHDOWN'}[command])
+        else:
+            await {Command.HOME: self.home, Command.VOLUME_UP: self.volume_up,
+                   Command.VOLUME_DOWN: self.volume_down, Command.MUTE: self.mute}[command]()
+
     async def start(self) -> None:
-        config: Configuration = self.kernel.get(ServiceName.CONFIGURATION)
         self.eventbus = self.kernel.get(ServiceName.EVENTBUS)
         self.telemetry = self.kernel.get(ServiceName.TELEMETRY)
-
-        settings = config.settings
-
-        if not settings.samsung_tv_ip:
-            raise RuntimeError("SAMSUNG_TV_IP is required")
-
-        self.ip = settings.samsung_tv_ip
-        self.token_file = Path(settings.samsung_tv_token_file)
 
         await self.telemetry.emit(
             TelemetryMessage.SAMSUNG_CONNECTING,
             source=self.name,
-            ip=self.ip,
+            **self._context(),
         )
 
+        token = self._authentication_token()
         try:
-            await self._connect()
+            await self._connect(token)
         except Exception:
             await self.telemetry.emit(
                 TelemetryMessage.SAMSUNG_CONNECTION_FAILED,
                 source=self.name,
-                ip=self.ip,
+                **self._context(),
             )
-            raise
+            raise RuntimeError(
+                f"Samsung connection failed for device {self.device.id}; "
+                "check connectivity and authentication in Stevie-Explorer"
+            ) from None
 
         await self.eventbus.publish(
             StevieEvent(
                 topic=Topic.DEVICE_TV_CONNECTED,
                 source=self.name,
-                payload={"ip": self.ip},
+                payload=self._context(),
             )
         )
 
         await self.telemetry.emit(
             TelemetryMessage.SAMSUNG_CONNECTED,
             source=self.name,
-            ip=self.ip,
+            **self._context(),
         )
 
     async def stop(self) -> None:
         if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+            try:
+                await self._ws.close()
+            except Exception:
+                raise RuntimeError(f"Samsung disconnect failed for device {self.device.id}") from None
+            finally:
+                self._ws = None
 
-        if self.eventbus and self.ip:
+        if self.eventbus:
             await self.eventbus.publish(
                 StevieEvent(
                     topic=Topic.DEVICE_TV_DISCONNECTED,
                     source=self.name,
-                    payload={"ip": self.ip},
+                    payload=self._context(),
                 )
             )
 
@@ -103,6 +129,7 @@ class SamsungTVService:
                 TelemetryMessage.SAMSUNG_KEY_PRESS,
                 source=self.name,
                 key=key,
+                **self._context(),
             )
 
         payload = {
@@ -115,7 +142,10 @@ class SamsungTVService:
             },
         }
 
-        await self._ws.send(json.dumps(payload))
+        try:
+            await self._ws.send(json.dumps(payload))
+        except Exception:
+            raise DeviceTransportUnavailableError(f"Samsung key send failed for device {self.device.id}") from None
         await asyncio.sleep(0.5)
 
     async def home(self) -> None:
@@ -137,8 +167,7 @@ class SamsungTVService:
 
         await self.press("KEY_ENTER")
 
-    async def _connect(self) -> None:
-        token = self._load_token()
+    async def _connect(self, token: str) -> None:
         url = self._build_url(token)
 
         ssl_context = ssl._create_unverified_context()
@@ -149,17 +178,32 @@ class SamsungTVService:
             ping_interval=None,
         )
 
-        first_message_raw = await self._ws.recv()
-        first_message = json.loads(first_message_raw)
+        try:
+            # Consume the greeting without persisting returned pairing credentials.
+            await self._ws.recv()
+        except BaseException:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            raise
 
-        new_token = first_message.get("data", {}).get("token")
-        if new_token:
-            self._save_token(new_token)
+    def _context(self) -> dict[str, str]:
+        return {"device_id": self.device.id, "display_name": self.device.display_name,
+                "ip": self.device.ip_address}
+
+    def _authentication_token(self) -> str:
+        samsung = (self.device.authentication or {}).get("samsung")
+        token = samsung.get("token") if isinstance(samsung, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            raise RuntimeError(
+                f"Samsung authentication unavailable for device {self.device.id}; "
+                "pair the device through Stevie-Explorer"
+            )
+        return token
 
     def _build_url(self, token: str | None) -> str:
-        if self.ip is None:
-            raise RuntimeError("Samsung TV IP has not been configured")
-
         encoded_name = base64.b64encode(
             self.app_name.encode("utf-8")
         ).decode("utf-8")
@@ -169,24 +213,10 @@ class SamsungTVService:
         if token:
             params["token"] = token
 
+        host = self.device.ip_address
+        if ":" in host:
+            host = f"[{host}]"
         return (
-            f"wss://{self.ip}:8002/api/v2/channels/samsung.remote.control?"
+            f"wss://{host}:8002/api/v2/channels/samsung.remote.control?"
             + urlencode(params)
         )
-
-    def _load_token(self) -> str | None:
-        if self.token_file is None:
-            raise RuntimeError("Samsung TV token file has not been configured")
-
-        if not self.token_file.exists():
-            return None
-
-        token = self.token_file.read_text().strip()
-        return token or None
-
-    def _save_token(self, token: str) -> None:
-        if self.token_file is None:
-            raise RuntimeError("Samsung TV token file has not been configured")
-
-        self.token_file.parent.mkdir(parents=True, exist_ok=True)
-        self.token_file.write_text(token)
