@@ -6,3 +6,4 @@ class Topic(StrEnum):
     DEVICE_TV_MESSAGE = "device.tv.message"
 
     SYSTEM_TELEMETRY_CREATED = "system.telemetry.created"
+    DEVICE_COMMAND_COMPLETED = "device.command.completed"

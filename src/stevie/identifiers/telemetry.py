@@ -173,3 +173,27 @@ class TelemetryMessage(Enum):
         grafana_key="stevie.device.samsung.key_press",
         description="Samsung TV key press sent.",
     )
+
+    DEVICE_COMMAND_STARTED = TelemetryMessageDefinition(
+        key="device.command.started",
+        level=TelemetryLevel.INFO,
+        category=TelemetryCategory.DEVICE,
+        grafana_key="stevie.device.command.started",
+        description="Device command started.",
+    )
+
+    DEVICE_COMMAND_COMPLETED = TelemetryMessageDefinition(
+        key="device.command.completed",
+        level=TelemetryLevel.INFO,
+        category=TelemetryCategory.DEVICE,
+        grafana_key="stevie.device.command.completed",
+        description="Device command completed.",
+    )
+
+    DEVICE_COMMAND_FAILED = TelemetryMessageDefinition(
+        key="device.command.failed",
+        level=TelemetryLevel.ERROR,
+        category=TelemetryCategory.DEVICE,
+        grafana_key="stevie.device.command.failed",
+        description="Device command failed.",
+    )

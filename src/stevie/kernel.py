@@ -46,6 +46,11 @@ class StevieKernel:
     def has(self, name: str | ServiceName) -> bool:
         return str(name) in self._registry
 
+    def components(self) -> list[dict[str, str]]:
+        """Return a detached metadata snapshot, never component state."""
+        return [{"name": name, "type": type(component).__name__}
+                for name, component in self._registry.items()]
+
     async def start(self) -> None:
         await self._emit(
             TelemetryMessage.KERNEL_STARTING,
@@ -74,7 +79,7 @@ class StevieKernel:
                 name=self.name
             )
 
-        except Exception:
+        except Exception as exc:
             await self._emit(
                 TelemetryMessage.KERNEL_START_FAILED,
                 name=self.name,
@@ -100,12 +105,12 @@ class StevieKernel:
 
         for service in reversed(self._services):
             try:
-                await self.emit(
+                await self._emit(
                     TelemetryMessage.KERNEL_SERVICE_STOPPING,
                     service=str(service.name)
                 )
                 await service.stop()
-                await self.emit(
+                await self._emit(
                     TelemetryMessage.KERNEL_SERVICE_STOPPED,
                     service=str(service.name)
                 )
